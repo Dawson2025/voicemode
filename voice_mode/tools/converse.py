@@ -34,6 +34,22 @@ _silero_device = "cpu"
 _silero_buffer = None  # int16 PCM samples accumulated at 16kHz until we have 512
 _SILERO_WINDOW_SIZE = 512  # Silero strictly requires 512 samples at 16kHz per call
 
+# --- voicemode-D tunables (env-var driven) ---
+# Default Silero speech-probability threshold. Lower = more permissive (treat ambiguous
+# sounds as speech). Higher = more selective (only count clear speech, useful in crowds).
+# Quiet room: 0.4-0.5 (default). Crowded room: 0.7-0.9.
+_SILERO_THRESHOLD = float(os.environ.get("VOICEMODE_SILERO_THRESHOLD", "0.5"))
+
+# Noisy-mode preset: when "true", overrides threshold to the noisy-room value and
+# suggests a shorter silence threshold (the silence threshold itself is set elsewhere
+# via VOICEMODE_SILENCE_THRESHOLD_MS — we just log a warning if it's still at the
+# spacious-default 5000ms).
+_VOICEMODE_NOISY_MODE = os.environ.get("VOICEMODE_NOISY_MODE", "").strip().lower() in ("1", "true", "yes", "on")
+if _VOICEMODE_NOISY_MODE:
+    # Bias toward selectivity. Empirically: 0.85 rejects most ambient murmur but still
+    # catches the user's directly-into-the-mic speech.
+    _SILERO_THRESHOLD = float(os.environ.get("VOICEMODE_SILERO_THRESHOLD_NOISY", "0.85"))
+
 try:
     import torch as _silero_torch
     from silero_vad import load_silero_vad as _silero_load
@@ -47,17 +63,23 @@ except Exception as _silero_err:
     pass
 
 
-def _silero_is_speech(audio_int16_16k, threshold: float = 0.5):
+def _silero_is_speech(audio_int16_16k, threshold=None):
     """Buffered Silero VAD on int16 PCM @ 16kHz.
 
     Silero requires EXACTLY 512 samples at 16kHz per call. Caller passes any-length
     16kHz int16 audio; this fn accumulates samples in a module-level buffer and only
     returns a speech/non-speech verdict when a full 512-sample window is ready.
 
+    Threshold defaults to the module-level _SILERO_THRESHOLD (set from
+    VOICEMODE_SILERO_THRESHOLD env var; bumped to ~0.85 if VOICEMODE_NOISY_MODE=true).
+    Caller can override per-call by passing `threshold=` explicitly.
+
     Returns:
         bool if a window was processed (True=speech)
         None if the buffer is not yet full (caller should keep previous state)
     """
+    if threshold is None:
+        threshold = _SILERO_THRESHOLD
     global _silero_buffer
     if _silero_buffer is None:
         _silero_buffer = np.array([], dtype=np.int16)
@@ -964,7 +986,10 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
     logger.info(f"record_audio_with_silence_detection called - SILERO_AVAILABLE={SILERO_AVAILABLE}, VAD_AVAILABLE={VAD_AVAILABLE}, DISABLE_SILENCE_DETECTION={DISABLE_SILENCE_DETECTION}, min_duration={min_duration}")
 
     if SILERO_AVAILABLE:
-        logger.info(f"🧠 Using Silero VAD on {_silero_device} (preferred over webrtcvad)")
+        _noisy_tag = " [NOISY MODE]" if _VOICEMODE_NOISY_MODE else ""
+        logger.info(f"🧠 Using Silero VAD on {_silero_device} (preferred over webrtcvad){_noisy_tag} — threshold={_SILERO_THRESHOLD}")
+        if _VOICEMODE_NOISY_MODE and SILENCE_THRESHOLD_MS >= 5000:
+            logger.warning(f"⚠️  Noisy mode is ON but VOICEMODE_SILENCE_THRESHOLD_MS={SILENCE_THRESHOLD_MS}ms is high. Consider setting it to ~1500ms for crowded environments.")
     elif VAD_AVAILABLE:
         logger.info("⚠️  Silero VAD unavailable, falling back to webrtcvad (energy-based)")
 
