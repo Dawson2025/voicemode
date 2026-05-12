@@ -48,6 +48,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Silero VAD (preferred over webrtcvad — neural network for speech/noise discrimination).
+# Patch lives in voice_mode/tools/converse.py — see voicemode-D fork.
+silero = [
+    "silero-vad>=6.2.1",
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+]
 livekit = [
     "livekit>=0.13.1",
     "livekit-agents>=0.10.2",

@@ -16,13 +16,66 @@ from pydub import AudioSegment
 from openai import AsyncOpenAI
 import httpx
 
-# Optional webrtcvad for silence detection
+# Optional webrtcvad for silence detection (fallback)
 try:
     import webrtcvad
     VAD_AVAILABLE = True
 except ImportError as e:
     webrtcvad = None
     VAD_AVAILABLE = False
+
+# Optional Silero VAD — neural-network VAD, much better speech/noise discrimination
+# than webrtcvad's energy-based detection. Preferred when available.
+# Patch source: voicemode-D fork (Dawson2025/voicemode @ dawson/silero-vad).
+# Design doc: layer_-1_research/.../layer_5_subx5_feature_agentic_tts/stage_5_06_development/outputs/silero_vad_patch_and_bt_audio.md
+SILERO_AVAILABLE = False
+_silero_model = None
+_silero_device = "cpu"
+_silero_buffer = None  # int16 PCM samples accumulated at 16kHz until we have 512
+_SILERO_WINDOW_SIZE = 512  # Silero strictly requires 512 samples at 16kHz per call
+
+try:
+    import torch as _silero_torch
+    from silero_vad import load_silero_vad as _silero_load
+    _silero_model = _silero_load(onnx=False)
+    if _silero_torch.cuda.is_available():
+        _silero_device = "cuda"
+        _silero_model = _silero_model.to(_silero_device)
+    SILERO_AVAILABLE = True
+except Exception as _silero_err:
+    # Silero unavailable — webrtcvad fallback remains active
+    pass
+
+
+def _silero_is_speech(audio_int16_16k, threshold: float = 0.5):
+    """Buffered Silero VAD on int16 PCM @ 16kHz.
+
+    Silero requires EXACTLY 512 samples at 16kHz per call. Caller passes any-length
+    16kHz int16 audio; this fn accumulates samples in a module-level buffer and only
+    returns a speech/non-speech verdict when a full 512-sample window is ready.
+
+    Returns:
+        bool if a window was processed (True=speech)
+        None if the buffer is not yet full (caller should keep previous state)
+    """
+    global _silero_buffer
+    if _silero_buffer is None:
+        _silero_buffer = np.array([], dtype=np.int16)
+    _silero_buffer = np.concatenate(
+        [_silero_buffer, np.asarray(audio_int16_16k, dtype=np.int16)]
+    )
+    if len(_silero_buffer) < _SILERO_WINDOW_SIZE:
+        return None
+    window = _silero_buffer[:_SILERO_WINDOW_SIZE]
+    _silero_buffer = _silero_buffer[_SILERO_WINDOW_SIZE:]
+    # Silero expects float32 in [-1, 1]
+    window_f = window.astype(np.float32) / 32768.0
+    tensor = _silero_torch.from_numpy(window_f)
+    if _silero_device == "cuda":
+        tensor = tensor.to(_silero_device)
+    with _silero_torch.no_grad():
+        prob = _silero_model(tensor, 16000).item()
+    return prob >= threshold
 
 from voice_mode.server import mcp
 from voice_mode.conch import Conch
@@ -908,10 +961,15 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
             - speech_detected: Boolean indicating if speech was detected during recording
     """
     
-    logger.info(f"record_audio_with_silence_detection called - VAD_AVAILABLE={VAD_AVAILABLE}, DISABLE_SILENCE_DETECTION={DISABLE_SILENCE_DETECTION}, min_duration={min_duration}")
-    
-    if not VAD_AVAILABLE:
-        logger.warning("webrtcvad not available, falling back to fixed duration recording")
+    logger.info(f"record_audio_with_silence_detection called - SILERO_AVAILABLE={SILERO_AVAILABLE}, VAD_AVAILABLE={VAD_AVAILABLE}, DISABLE_SILENCE_DETECTION={DISABLE_SILENCE_DETECTION}, min_duration={min_duration}")
+
+    if SILERO_AVAILABLE:
+        logger.info(f"🧠 Using Silero VAD on {_silero_device} (preferred over webrtcvad)")
+    elif VAD_AVAILABLE:
+        logger.info("⚠️  Silero VAD unavailable, falling back to webrtcvad (energy-based)")
+
+    if not VAD_AVAILABLE and not SILERO_AVAILABLE:
+        logger.warning("No VAD available (webrtcvad or silero-vad), falling back to fixed duration recording")
         # For fallback, assume speech is present since we can't detect
         return (record_audio(max_duration), True)
     
@@ -926,9 +984,12 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
     logger.info(f"🎤 Recording with silence detection (max {max_duration}s)...")
     
     try:
-        # Initialize VAD with provided aggressiveness or default
+        # Initialize webrtcvad as fallback (Silero, if available, is preferred at the call site)
         effective_vad_aggressiveness = vad_aggressiveness if vad_aggressiveness is not None else VAD_AGGRESSIVENESS
-        vad = webrtcvad.Vad(effective_vad_aggressiveness)
+        vad = webrtcvad.Vad(effective_vad_aggressiveness) if VAD_AVAILABLE else None
+        # Reset Silero rolling buffer at the start of each recording
+        global _silero_buffer
+        _silero_buffer = None
         
         # Calculate chunk size (must be 10, 20, or 30ms worth of samples)
         chunk_samples = int(SAMPLE_RATE * VAD_CHUNK_DURATION_MS / 1000)
@@ -1022,14 +1083,26 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                         vad_chunk = vad_chunk[:vad_chunk_samples].astype(np.int16)
                         chunk_bytes = vad_chunk.tobytes()
                         
-                        # Check if chunk contains speech
+                        # Check if chunk contains speech — prefer Silero, fall back to webrtcvad
                         try:
-                            is_speech = vad.is_speech(chunk_bytes, vad_sample_rate)
-                            if VAD_DEBUG:
-                                # Log VAD decision every 500ms for less spam
-                                if int(recording_duration * 1000) % 500 == 0:
+                            if SILERO_AVAILABLE:
+                                silero_verdict = _silero_is_speech(vad_chunk)
+                                if silero_verdict is None:
+                                    # Buffer not yet full (need 512 samples @ 16kHz);
+                                    # keep previous state until we have a window
+                                    is_speech = speech_detected if speech_detected else False
+                                    if VAD_DEBUG and int(recording_duration * 1000) % 500 == 0:
+                                        logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: silero buffer warming, holding state={'ACTIVE' if speech_detected else 'WAITING'}")
+                                else:
+                                    is_speech = silero_verdict
+                                    if VAD_DEBUG and int(recording_duration * 1000) % 500 == 0:
+                                        rms = np.sqrt(np.mean(chunk.astype(float)**2))
+                                        logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: silero_speech={is_speech}, RMS={rms:.0f}, device={_silero_device}, state={'WAITING' if not speech_detected else 'ACTIVE'}")
+                            else:
+                                is_speech = vad.is_speech(chunk_bytes, vad_sample_rate)
+                                if VAD_DEBUG and int(recording_duration * 1000) % 500 == 0:
                                     rms = np.sqrt(np.mean(chunk.astype(float)**2))
-                                    logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: speech={is_speech}, RMS={rms:.0f}, state={'WAITING' if not speech_detected else 'ACTIVE'}")
+                                    logger.info(f"[VAD_DEBUG] t={recording_duration:.1f}s: webrtc_speech={is_speech}, RMS={rms:.0f}, state={'WAITING' if not speech_detected else 'ACTIVE'}")
                         except Exception as vad_e:
                             logger.warning(f"VAD error: {vad_e}, treating as speech")
                             is_speech = True
